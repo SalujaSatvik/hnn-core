@@ -312,7 +312,7 @@ def pick_connection(net, src_gids=None, target_gids=None, loc=None, receptor=Non
 
     return sorted(conn_set)
 
-def pick_connection_from_dataframe(net, src_gids=None, target_gids=None, loc=None, receptor=None):
+def pick_connection_from_dataframe(net, src_gids=None, target_gids=None, loc=None, receptor=None, conn_type="recurrent"):
     valid_srcs = list(net.gid_ranges.keys())  # includes drives as srcs
     valid_targets = list(net.cell_types.keys())
     src_gids_checked = _check_gids(
@@ -332,7 +332,12 @@ def pick_connection_from_dataframe(net, src_gids=None, target_gids=None, loc=Non
     loc_list = _string_input_to_list(loc, valid_loc, "loc")
     receptor_list = _string_input_to_list(receptor, valid_receptor, "receptor")
 
-    conn_df = net.connectivity_df
+    # pick a drive or recurrent connection
+    if conn_type == "recurrent":
+        conn_df = net.recurrent_connectivity_df
+    elif conn_type == "drive":
+        conn_df = net.external_drives_connectivity_df
+
     any_search_applied = False
 
     if src_gids_checked: #get a list of source gids
@@ -354,8 +359,8 @@ def pick_connection_from_dataframe(net, src_gids=None, target_gids=None, loc=Non
     if not any_search_applied:
         return list()
 
-    #counter behaves same as index in the connectivity list
-    return sorted(conn_df["counter"].unique().tolist())
+    # KD: I propose to actually return the df not just the indices
+    return conn_df 
 
 def _get_cell_index_by_synapse_type(net):
     """Returns the indices of excitatory and inhibitory cells in the Network.
@@ -519,7 +524,8 @@ class Network:
                 DeprecationWarning,
                 stacklevel=1,
             )
-        self.connectivity_df = pd.DataFrame()
+        self.recurrent_connectivity_df = pd.DataFrame()
+        self.external_drives_connectivity_df = pd.DataFrame()
         self.cell_response = None
         # external drives and biases
         self.external_drives = dict()
@@ -529,15 +535,16 @@ class Network:
         self.threshold = self._params["threshold"]
         self.delay = 1.0
         self.use_dataframe = use_dataframe
+        # KD: would it ever be the case that a user would add drives to their input df???
         if isinstance(self.use_dataframe, pd.DataFrame):
-            self.connectivity_df = use_dataframe
+            self.recurrent_connectivity_df = use_dataframe
         # extracellular recordings (if applicable)
         self.rec_arrays = dict()
 
         # simulation-time params
         self._tstop = None
         self._dt = None
-        self._counter=0
+        self._conn_idx=0
 
         # contents of pos_dict determines all downstream inferences of
         # cell counts, real and artificial
@@ -1709,13 +1716,14 @@ class Network:
                         delay=delays,
                         lamtha=space_constant,
                         probability=probability,
-                        conn_seed=drive["conn_seed"] + seed_increment,
+                        conn_seed=drive["conn_seed"] + seed_increment
                     )
                     # Ensure that AMPA/NMDA connections target the same gids
-                    if receptor_idx > 0:
-                        self.connectivity[-1]["src_gids"] = self.connectivity[-2][
-                            "src_gids"
-                        ]
+                    # KD: remove assuming this isn't important
+                    # if receptor_idx > 0:
+                    #     self.connectivity[-1]["src_gids"] = self.connectivity[-2][
+                    #         "src_gids"
+                    #     ]
 
             else:
                 for receptor_idx, receptor in enumerate(
@@ -1731,14 +1739,14 @@ class Network:
                         delay=delays,
                         lamtha=space_constant,
                         probability=probability,
-                        conn_seed=drive["conn_seed"] + seed_increment,
+                        conn_seed=drive["conn_seed"] + seed_increment
                     )
                     # Ensure that AMPA/NMDA connections target the same gids
                     # when probability < 1
-                    if receptor_idx > 0:
-                        self.connectivity[-1]["src_gids"] = self.connectivity[-2][
-                            "src_gids"
-                        ]
+                    # if receptor_idx > 0:
+                    #     self.connectivity[-1]["src_gids"] = self.connectivity[-2][
+                    #         "src_gids"
+                    #     ]
 
     def _reset_drives(self):
         # reset every time called again, e.g., from dipole.py or in self.copy()
@@ -1778,12 +1786,8 @@ class Network:
                     trial_seed_offset = self._n_gids
                     if drive["cell_specific"]:
                         if self.use_dataframe:
-                            conn_idxs = pick_connection_from_dataframe(self, src_gids=drive_cell_gid)
-                            target_types = set(
-                                self.connectivity_df.loc[
-                                    self.connectivity_df["counter"].isin(conn_idxs),
-                                    "target_type",
-                                ]
+                            conn_drive = pick_connection_from_dataframe(self, src_gids=drive_cell_gid, conn_type="drive")
+                            target_types = set(conn_drive["target_type"]
                             )
                         else:
                             conn_idxs = pick_connection(self, src_gids=drive_cell_gid)
@@ -2428,7 +2432,7 @@ class Network:
         gain=1.0,
         allow_autapses=True,
         probability=1.0,
-        conn_seed=None,
+        conn_seed=None
     ):
         """Appends connections to connectivity list
 
@@ -2633,7 +2637,7 @@ class Network:
                     nc_dict = conn["nc_dict"]
                     rows.append(
                         {   
-                            "counter":self._counter,
+                            "conn_idx":self._conn_idx,
                             "src_gid": src_gid,
                             "target_gid": target_gid,
                             "src_type": self.gid_to_type(src_gids[0]),
@@ -2649,10 +2653,19 @@ class Network:
                             "gain": nc_dict["gain"],
                         }
                     )
-        self.connectivity_df = pd.concat(
-            [self.connectivity_df, pd.DataFrame(rows)], ignore_index=True
-        )
-        self._counter+=1
+
+        src_type = _gid_to_type(src_gids[0], self.gid_ranges)
+        # Add to recurrent_connectivity_df if source is network cell
+        if src_type in list(self.cell_types.keys()):
+            self.recurrent_connectivity_df = pd.concat(
+                [self.recurrent_connectivity_df, pd.DataFrame(rows)], ignore_index=True
+            )
+        else:
+            self.external_drives_connectivity_df = pd.concat(
+                            [self.external_drives_connectivity_df, pd.DataFrame(rows)], ignore_index=True
+                        )
+        # Add to external_drive_connectivity_df if source is drive cell
+        self._conn_idx+=1
 
     def clear_connectivity(self):
         """Remove all connections defined in Network.connectivity"""
@@ -2665,10 +2678,8 @@ class Network:
 
         self.connectivity = connectivity
 
-        # Keep only drive connections in connectivity_df
-        self.connectivity_df = self.connectivity_df[
-            self.connectivity_df["src_type"].isin(self.external_drives.keys())
-        ].reset_index(drop=True)
+        # Empty recurrent connectivity
+        self.recurrent_connectivity_df = self.recurrent_connectivity_df.iloc[0:0]
 
     def clear_drives(self):
         """Remove all drives defined in Network.connectivity and Network.Connectivity"""
@@ -2679,10 +2690,8 @@ class Network:
             if conn["src_type"] not in self.external_drives.keys()
         ]
 
-        #Removing drive connections from connectivity DataFrame
-        self.connectivity_df = self.connectivity_df[
-            ~self.connectivity_df["src_type"].isin(self.external_drives.keys())
-        ].reset_index(drop=True)
+        # Empty drive connectivity
+        self.external_drives_connectivity_df = self.external_drives_connectivity_df.iloc[0:0]
 
         for cell_name in list(self.gid_ranges.keys()):
             if cell_name in self.external_drives:
@@ -2838,11 +2847,11 @@ class Network:
         # Retrieve the gain value for each connection type
         values = {}
         for conn_type, (src_idxs, target_idxs) in conn_types.items():
-            picks = pick_connection(self, src_gids=src_idxs, target_gids=target_idxs)
-
-            if picks:
-                # Extract the gain from the first connection
-                values[conn_type] = self.connectivity[picks[0]]["nc_dict"]["gain"]
+            picks = pick_connection_from_dataframe(self, src_gids=src_idxs, target_gids=target_idxs, conn_type="recurrent")
+            # KD: we can now use the actual information from the df
+            if not picks.empty:
+                # Extract maximum gain
+                values[conn_type] = picks["gain"].max() 
 
         # This writes the warning to stdout
         _check_global_synaptic_gains_uniformity(self)
@@ -3124,8 +3133,8 @@ class ConnectivityList(list):
         return super().__getitem__(key)
 
     def __repr__(self):
-        return """net.connectivity is deprecated - connection data now
-            lives in net.connectivity_df. """ + super().__repr__()
+        return """net.connectivity is deprecated - data on recurrent connections now
+            lives in net.recurrent_connectivity_df, and external connections (drive) now live in net.external_drives_connectivity_df. """ + super().__repr__()
 
 
 class _NetworkDrive(dict):
